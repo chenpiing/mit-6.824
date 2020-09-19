@@ -106,6 +106,7 @@ func (wk *Worker) Shutdown(_ *struct{}, res *ShutdownReply) error {
 
 // Tell the master we exist and ready to work
 func (wk *Worker) register(master string) {
+	fmt.Printf("Worker %s Register\n", wk.name)
 	args := new(RegisterArgs)
 	args.Worker = wk.name
 	ok := call(master, "Master.Register", args, new(struct{}))
