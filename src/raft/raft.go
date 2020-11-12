@@ -53,9 +53,9 @@ const (
 	CANDIDATE Status = 1000
 	LEADER    Status = 2000
 
-	TIMEOUT_MIN        int64 = 200
-	TIMEOUT_INTERVAL   int64 = 300
-	HEARTBEAT_INTERVAL int64 = 60
+	TIMEOUT_MIN        int64 = 100
+	TIMEOUT_INTERVAL   int64 = 400
+	HEARTBEAT_INTERVAL int64 = 30
 )
 
 type LogEntry struct {
@@ -82,6 +82,7 @@ type Raft struct {
 	role      Status // 0-follower 1-candidate 2-leader
 	commitIndex int
 	lastApplied int
+	applyCh chan ApplyMsg
 
 	nextIndex       []int
 	matchIndex      []int
@@ -101,19 +102,15 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	rf.Lock()
+	// rf.Lock()
 	term := rf.currentTerm
 	isleader := (rf.role == LEADER && rf.votedFor == rf.me)
-	rf.Unlock()
-
+	// rf.Unlock()
 	// Your code here (2A).
 	return term, isleader
 }
 
 func (rf *Raft) GetIndex() int {
-	rf.Lock()
-	defer rf.Unlock()
 	return len(rf.log)
 }
 
@@ -214,8 +211,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		rf.interrupteSleepNoLock()
-		rf.Unlock()
 		DPrintf("node=%v, term=%v receive rv req from node=%v term=%v, reply=(%v, %v)", rf.me, rf.currentTerm, args.CandidateId, args.Term, reply.Term, reply.VoteGranted)
+		rf.Unlock()
 		return
 	}
 	reply.VoteGranted = false
@@ -274,7 +271,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
-	DPrintf("node=%v term=%v receive ac req from node=%v term=%v", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	DPrintf("node=%v term=%v receive ae req from node=%v term=%v, args=%v", rf.me, rf.currentTerm, args.LeaderId, args.Term, *args)
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -287,13 +284,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = args.Commands
 			reply.Success = true
 			rf.interrupteSleepNoLock()
+			rf.commitWithoutLock(args.LeaderCommit)
+			DPrintf("[0] node=%v term=%v latest log=%v", rf.me, rf.currentTerm, rf.log)
 			rf.Unlock()
 			return
 		}
 
-		if len(rf.log)-1 < args.PreLogIndex {
+		if len(rf.log) - 1 < args.PreLogIndex {
 			reply.Success = false
 			rf.interrupteSleepNoLock()
+			DPrintf("[1] node=%v term=%v latest log=%v", rf.me, rf.currentTerm, rf.log)
 			rf.Unlock()
 			return
 		}
@@ -304,18 +304,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PreLogIndex == 0 {
 				rf.log = nil
 			} else {
-				rf.log = rf.log[0 : args.PreLogIndex-1]
+				rf.log = rf.log[0 : args.PreLogIndex]
 			}
 			rf.interrupteSleepNoLock()
+			DPrintf("[2] node=%v term=%v latest log=%v", rf.me, rf.currentTerm, rf.log)
 			rf.Unlock()
 			return
 		}
 
-		rf.log = append(rf.log[0:args.PreLogIndex], args.Commands...)
+		rf.log = append(rf.log[0 : args.PreLogIndex + 1], args.Commands...)
 		reply.Success = true
 		rf.interrupteSleepNoLock()
+		rf.commitWithoutLock(args.LeaderCommit)
 	}
+	DPrintf("[3] node=%v term=%v latest log=%v", rf.me, rf.currentTerm, rf.log)
 	rf.Unlock()
+}
+
+func (rf *Raft) commitWithoutLock(commitId int) {
+	if commitId < 0 {
+		return
+	}
+	for i := commitId; i < len(rf.log); i++ {
+		DPrintf("node=%v term=%v will send log[%v] to chan, curLeaderCommit=%v", rf.me, rf.currentTerm, i, commitId)
+		go func(id int) {
+			rf.applyCh <- ApplyMsg{true, rf.log[id].Command, rf.log[id].CommandIndex + 1}
+		} (i)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -340,6 +355,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
 	index := rf.GetIndex()
+	DPrintf("node=%v term=%v isLeader=%v nextIndex=%v receive start rpc, command=%v", rf.me, term, isLeader, index, command)
 	if !isLeader {
 		return index, term, isLeader
 	}
@@ -349,10 +365,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	id := len(rf.log)
 	rf.log = append(rf.log, &LogEntry{command, rf.currentTerm, id})
-	rf.doAppendEntries()
-	rf.cond.Wait()
+	cnt := rf.doAppendEntries()
+	if cnt >= len(rf.peers) / 2 {
+		go func(isValid bool, cmd interface{}, id int, applyCh chan ApplyMsg) {
+			applyCh <- ApplyMsg{isValid, cmd, id}
+			DPrintf("node=%v term=%v isLeader=%v send command=%v to chan finish", rf.me, term, isLeader, command)
+		} (true, command, rf.commitIndex + 1, rf.applyCh)
+	}
 	rf.Unlock()
-	return id, term, isLeader
+	return id + 1, term, isLeader
 }
 
 //
@@ -396,6 +417,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.cond = sync.NewCond(&rf.mu)
 	rf.nextIndex = initList(len(peers), 0)
 	rf.matchIndex = initList(len(peers), -1)
+	rf.commitIndex = -1
+	rf.applyCh = applyCh
 
 	DPrintf("Make Raft instance, peers=%v, me=%v, role=%v", peers, me, rf.role)
 
@@ -420,7 +443,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 			rf.Unlock()
 			if sleepAWhile {
-				time.Sleep(time.Millisecond * 20)
+				time.Sleep(time.Millisecond * 10)
 			} else {
 				time.Sleep(time.Millisecond * 5)
 			}
@@ -430,8 +453,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// worker routine
 	go func() {
 		for {
+			
 			needResetTimer := true
 			rf.Lock()
+			// DPrintf("starting pos [node=%v  term=%v  role=%v]", rf.me, rf.currentTerm, rf.role)
+			
 			// DPrintf("[0] node=%v, term=%v, role=%v", rf.me, rf.currentTerm, rf.role)
 			if rf.role == FOLLOWER {
 				timeout := rand.Int63n(TIMEOUT_INTERVAL) + TIMEOUT_MIN
@@ -451,23 +477,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				if needResetTimer {
 					// reset election timeout
 					timeout := rand.Int63n(TIMEOUT_INTERVAL) + TIMEOUT_MIN
-					// rf.ResetTimer(timeout)
 					rf.sleepNoLock(timeout)
+				}
+				if rf.role == FOLLOWER {
+					continue
 				}
 				rf.currentTerm++
 				rf.votedFor = rf.me
-				DPrintf("node=%v, term=%v is candidate", rf.me, rf.currentTerm)
+				// DPrintf("node=%v term=%v role=%v is candidate", rf.me, rf.currentTerm, rf.role)
 				
 				curTerm := rf.currentTerm
 				votes := 0
 				wg := &sync.WaitGroup{}
+				rf.Unlock()
 				wg.Add(1)
-
 				// send requestVote rpc to all other servers
 				go func(curTerm *int, votes *int) {
 					wg0 := &sync.WaitGroup{}
 					l := sync.Mutex{}
 					maxTerm := 0
+					finishSends := 0
 					for i := 0; i < len(peers); i++ {
 						if i == me {
 							continue
@@ -476,21 +505,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						go func(other int) {
 							args := RequestVoteArgs{*curTerm, me}
 							reply := RequestVoteReply{}
+							// DPrintf("node=%v term=%v before send rv req to node=%v", rf.me, rf.currentTerm, other)
 							ok := rf.sendRequestVote(other, &args, &reply)
-							if ok {
-								l.Lock()
-								if reply.VoteGranted {
-									*votes++
-								} else if reply.Term > *curTerm {
-									if reply.Term > maxTerm {
-										maxTerm = reply.Term
+							l.Lock()
+							if finishSends < len(peers) - 1 {
+								// DPrintf("node=%v term=%v after send rv req to node=%v", rf.me, rf.currentTerm, other)
+								if ok {
+									if reply.VoteGranted {
+										*votes++
+										if *votes >= len(peers) / 2 {
+											for ; finishSends < len(peers) - 1; finishSends++ {
+												wg0.Done()
+											}
+											l.Unlock()
+											return
+										}
+									} else if reply.Term > *curTerm {
+										if reply.Term > maxTerm {
+											maxTerm = reply.Term
+										}
 									}
 								}
-								l.Unlock()
+								finishSends++
+								wg0.Done()
 							}
-							wg0.Done()
+							l.Unlock()
 						}(i)
 					}
+					go func() {
+						randomT := rand.Int63n(30)
+						time.Sleep(time.Duration(randomT) * time.Millisecond)
+						l.Lock()
+						if finishSends < len(peers) - 1 {
+							// DPrintf("node=%v term=%v give up send rv req", rf.me, rf.currentTerm)
+							for ; finishSends < len(peers) - 1; finishSends++ {
+								wg0.Done()
+							}
+						}
+						l.Unlock()
+					} ()
 					wg0.Wait()
 					if maxTerm > *curTerm {
 						*curTerm = maxTerm
@@ -500,20 +553,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				
 				// DPrintf("candidate node=%v term=%v waiting for requestVote rpc result", rf.me, rf.currentTerm)
 				wg.Wait()
-				// DPrintf("node=%v term=%v gathered votes=%v", rf.me, rf.currentTerm, votes)
-				if curTerm > rf.currentTerm {
-					rf.currentTerm = curTerm
-					rf.role = FOLLOWER
-					rf.votedFor = -1
-				} else if votes >= len(rf.peers)/2 {
-					rf.role = LEADER
-					// DPrintf("node=%v term=%v gathered majority votes=%v, becomes leader", rf.me, rf.currentTerm, votes)
+				rf.Lock()
+				// DPrintf("node=%v term=%v role=%v gathered votes=%v", rf.me, rf.currentTerm, rf.role, votes)
+				if rf.role == CANDIDATE {
+					if curTerm > rf.currentTerm {
+						rf.currentTerm = curTerm
+						rf.role = FOLLOWER
+						rf.votedFor = -1
+					} else if votes >= len(rf.peers)/2 {
+						rf.role = LEADER
+						// DPrintf("node=%v term=%v gathered majority votes=%v, becomes leader", rf.me, rf.currentTerm, votes)
+					}
 				}
 			}
 
 			// DPrintf("[2] node=%v, term=%v, role=%v", rf.me, rf.currentTerm, rf.role)
 			if rf.role == LEADER {
-				// DPrintf("node=%v term=%v is leader", rf.me, rf.currentTerm)
+				DPrintf("node=%v term=%v role=%v is leader", rf.me, rf.currentTerm, rf.role)
 				// send AppendEntries rpc
 				rf.doAppendEntries()
 				rf.sleepNoLock(HEARTBEAT_INTERVAL)
@@ -575,13 +631,13 @@ func (rf *Raft) doAppendEntries() int {
 		lastLogIndex := len(rf.log)
 		args := rf.BuildAppendEntriesArgs(i)
 		go func(server int, args AppendEntriesArgs, lastLogIndex int, me int, term int, nextIndex []int, matchIndex []int) {
-			// DPrintf("leader node=%v term=%v send ae rpc to node=%v", me, term, server)
+			DPrintf("leader node=%v term=%v send ae rpc to node=%v", me, term, server)
 			// mark done once firing up go routine
 			reply := AppendEntriesReply{-1, false}
 			ok := rf.sendAppendEntries(server, &args, &reply)
-			// DPrintf("leader node=%v term=%v finish sending ae rpc to node=%v", me, term, server)
 			l.Lock()
 			if finishSends < len(rf.peers) - 1 {
+				DPrintf("leader node=%v term=%v finish sending ae rpc to node=%v", me, term, server)
 				if ok {
 					if !reply.Success {
 						if reply.Term > maxTerm {
@@ -591,10 +647,18 @@ func (rf *Raft) doAppendEntries() int {
 						nextIndex[server] = lastLogIndex
 						matchIndex[server] = lastLogIndex - 1
 						cnt++
+						if cnt >= len(rf.peers) / 2 {
+							for ; finishSends < len(rf.peers) - 1; finishSends++ {
+								wg.Done()
+							}
+							DPrintf("leader node=%v term=%v get majority ae rpc response", me, term)
+							l.Unlock()	
+							return
+						}
 					}
-					// DPrintf("leader node=%v term=%v receive ae rpc from node=%v, success=%v", me, term, server, reply.Success)
+					DPrintf("leader node=%v term=%v receive ae rpc from node=%v, success=%v", me, term, server, reply.Success)
 				} else {
-					// DPrintf("node=%v term=%v send ae rpc to node=%v failed", me, term, server)
+					DPrintf("node=%v term=%v send ae rpc to node=%v failed", me, term, server)
 				}
 				finishSends++
 				wg.Done()
@@ -606,13 +670,17 @@ func (rf *Raft) doAppendEntries() int {
 	go func() {
 		time.Sleep(time.Millisecond * 60)
 		l.Lock()
-		for i := finishSends; i < len(rf.peers) - 1; i++ {
-			finishSends++
-			wg.Done()
+		if finishSends < len(rf.peers) - 1 {
+			DPrintf("leader node=%v term=%v role=%v give up send ae rpc", rf.me, rf.currentTerm, rf.role)
+			for ; finishSends < len(rf.peers) - 1; finishSends++ {
+				wg.Done()
+			}
 		}
 		l.Unlock()
 	} ()
+
 	wg.Wait()
+	DPrintf("leader node=%v term=%v finish waiting for ae rpc response", rf.me, rf.currentTerm)
 	l.Lock()
 	// stoping waiting and start processing
 	if maxTerm > rf.currentTerm {
@@ -627,6 +695,16 @@ func (rf *Raft) doAppendEntries() int {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.matchIndex[i] = matchIndex[i]
 	}
+	if cnt >= len(rf.peers) / 2 {
+		m := -1
+		for i, v := range rf.matchIndex {
+			if i == 0 || m < v {
+				m = v
+			}
+		}
+		rf.commitIndex = m
+	}
+	DPrintf("leader node=%v term=%v commitId=%v matchIdxs=%v finish ae rpc, success=%v", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, cnt)
 	l.Unlock()
 	return cnt
 }

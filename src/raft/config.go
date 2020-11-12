@@ -166,11 +166,13 @@ func (cfg *config) start1(i int) {
 	// listen to messages from Raft indicating newly committed messages.
 	applyCh := make(chan ApplyMsg)
 	go func() {
+		DPrintf("tester [%v] fire applyCh", i)
 		for m := range applyCh {
 			err_msg := ""
 			if m.CommandValid == false {
 				// ignore other types of ApplyMsg
 			} else if v, ok := (m.Command).(int); ok {
+				DPrintf("tester[%v] receive cmd=%v", i, v)
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
@@ -180,6 +182,7 @@ func (cfg *config) start1(i int) {
 					}
 				}
 				_, prevok := cfg.logs[i][m.CommandIndex-1]
+				DPrintf("tester[%v] add log", i)
 				cfg.logs[i][m.CommandIndex] = v
 				if m.CommandIndex > cfg.maxIndex {
 					cfg.maxIndex = m.CommandIndex
@@ -302,10 +305,14 @@ func (cfg *config) checkOneLeader() int {
 
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
+			DPrintf("------------------------------------- check one leader, checking node=%v", i)
 			if cfg.connected[i] {
+				DPrintf("------------------------------------- check one leader, before checking connected node=%v", i)
 				if term, leader := cfg.rafts[i].GetState(); leader {
+					DPrintf("------------------------------------- check one leader, node=%v is leader", i)
 					leaders[term] = append(leaders[term], i)
 				}
+				DPrintf("------------------------------------- check one leader, after checking connected node=%v", i)
 			}
 		}
 
@@ -366,6 +373,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
+		DPrintf("logs[%v][%v] = %v ok=%v", i, index, cmd1, ok)
 		cfg.mu.Unlock()
 
 		if ok {
@@ -452,6 +460,7 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				DPrintf("nd=%v cmd1=%v", nd, cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
@@ -462,13 +471,13 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
-				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				cfg.t.Fatalf("[0] one(%v) failed to reach agreement", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+	cfg.t.Fatalf("[1] one(%v) failed to reach agreement", cmd)
 	return -1
 }
 
