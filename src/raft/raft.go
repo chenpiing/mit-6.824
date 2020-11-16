@@ -53,9 +53,9 @@ const (
 	CANDIDATE Status = 1000
 	LEADER    Status = 2000
 
-	TIMEOUT_MIN        int64 = 100
-	TIMEOUT_INTERVAL   int64 = 400
-	HEARTBEAT_INTERVAL int64 = 30
+	TIMEOUT_MIN        int64 = 300
+	TIMEOUT_INTERVAL   int64 = 500
+	HEARTBEAT_INTERVAL int64 = 100
 )
 
 type LogEntry struct {
@@ -83,6 +83,7 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	applyCh chan ApplyMsg
+	lastNewEntry *LogEntry
 
 	nextIndex       []int
 	matchIndex      []int
