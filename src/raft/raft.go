@@ -17,13 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -42,6 +44,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,18 +63,43 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent variables
+	votedFor int
+	term     int
+	log      []LogEntry
+
+	// volatile state
+	commitIndex int
+	lastApplied int
+	status      int
+
+	nextIndex  []int
+	matchIndex []int
+
+	timeChan   chan int64
+	wakeupChan chan int
+	resChan    chan bool
+	t          int64
 }
+
+const (
+	FOLLOWER  = 0
+	CANDIDATE = 1
+	LEADER    = 2
+
+	MIN_SLEEP_TIME = 400
+	MAX_SLEEP_TIME = 800
+	HEARTBEAT_TIME = 100
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.Lock("GetState")
+	defer rf.Unlock("GetState")
 	// Your code here (2A).
-	return term, isleader
+	return rf.term, rf.status == LEADER
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +116,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,8 +139,51 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      []LogEntry
+}
 
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.Lock("AppendEntries")
+	defer rf.Unlock("AppendEntries")
+	if args.Term < rf.term {
+		reply.Success = false
+		reply.Term = rf.term
+		return
+	} else if args.Term > rf.term {
+		rf.term = reply.Term
+		rf.status = FOLLOWER
+		rf.votedFor = args.LeaderId
+	}
+	index, entry := rf.getEntryNonLocking(args.PrevLogIndex)
+	if entry.Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.term
+		if index >= 0 {
+			rf.log = rf.log[0:index]
+		}
+	} else {
+		rf.log = append(rf.log[0:index+1], args.Entries...)
+		reply.Success = true
+		reply.Term = rf.term
+	}
+	rf.StopSleep()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -116,6 +191,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogTerm  int
+	LastLogIndex int
 }
 
 //
@@ -124,6 +203,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -131,6 +212,27 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.Lock("RequestVote")
+	defer rf.Unlock("RequestVote")
+	if args.Term > rf.term {
+		rf.term = args.Term
+		rf.votedFor = -1
+		rf.status = FOLLOWER
+		rf.StopSleep()
+	} else if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.VoteGranted = false
+		return
+	}
+
+	lastLog := rf.GetLastLogNonLocking()
+	logUpToDate := args.LastLogTerm > lastLog.Term || ((lastLog.Term == args.LastLogTerm) && (args.LastLogIndex >= lastLog.Index))
+	reply.VoteGranted = (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && logUpToDate
+	reply.Term = rf.term
+	if reply.VoteGranted && rf.votedFor == -1 {
+		rf.votedFor = args.CandidateId
+	}
 }
 
 //
@@ -167,7 +269,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -189,7 +290,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -201,6 +301,62 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+func (rf *Raft) initNextIndex() {
+	rf.nextIndex = make([]int, len(rf.peers))
+	logLen := len(rf.log)
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = logLen + 1
+	}
+}
+
+func (rf *Raft) initMatchIndex() {
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.matchIndex[i] = 0
+	}
+}
+
+func (rf *Raft) StartTimer() {
+	rf.t = 0
+	for {
+		select {
+		case rf.t = <-rf.timeChan:
+			if rf.t <= 0 {
+				rf.t = 0
+				rf.resChan <- false
+			}
+		case <-rf.wakeupChan:
+			rf.t = 0
+			rf.resChan <- false
+		default:
+			if rf.t > 0 && time.Now().UnixNano()/1e6 >= rf.t {
+				rf.t = 0
+				rf.resChan <- true
+			}
+			time.Sleep(time.Duration(20) * time.Millisecond)
+		}
+	}
+}
+
+func (rf *Raft) StartSleep(t int64) bool {
+	if t <= 0 || rf.timeChan == nil || rf.resChan == nil {
+		return false
+	}
+	now := time.Now().UnixNano() / 1e6
+	elapseTime := now + t
+
+	rf.timeChan <- elapseTime
+	// DPrintf("server[%v][%v] will sleep %v mills", rf.me, rf.term, t)
+	return <-rf.resChan
+}
+
+func (rf *Raft) StopSleep() {
+	if rf.wakeupChan == nil || rf.t == 0 {
+		return
+	}
+	rf.wakeupChan <- 0
 }
 
 //
@@ -222,10 +378,276 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.votedFor = -1
+	rf.term = 0
+	rf.status = FOLLOWER
+	rf.initNextIndex()
+	rf.initMatchIndex()
+	rf.timeChan = make(chan int64)
+	rf.wakeupChan = make(chan int)
+	rf.resChan = make(chan bool)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.StartTimer()
+
+	go func() {
+		for {
+			switch rf.status {
+			case FOLLOWER:
+				DPrintf("server[%v][%v] as follower", rf.me, rf.term)
+				t := rand.Int63n(int64(MAX_SLEEP_TIME-MIN_SLEEP_TIME)) + int64(MIN_SLEEP_TIME)
+				res := rf.StartSleep(t)
+				if res {
+					rf.Lock("Make.FOLLOWER case")
+					rf.status = CANDIDATE
+					rf.term++
+					rf.Unlock("Make.FOLLOWER case")
+				}
+			case CANDIDATE:
+				DPrintf("server[%v][%v] as candidate", rf.me, rf.term)
+				// setup request votes process
+				go rf.MakeRequestVotes()
+				t := rand.Int63n(int64(MAX_SLEEP_TIME-MIN_SLEEP_TIME)) + int64(MIN_SLEEP_TIME)
+				res := rf.StartSleep(t)
+				if res {
+					DPrintf("server[%v][%v] elect leader failed, timeout", rf.me, rf.term)
+					rf.Lock("Make.CANDIDATE case")
+					rf.status = CANDIDATE
+					rf.term++
+					rf.Unlock("Make.CANDIDATE case")
+				}
+			case LEADER:
+				DPrintf("server[%v][%v] as leader", rf.me, rf.term)
+				rf.MakeAppendEntries()
+				t := int64(HEARTBEAT_TIME)
+				rf.StartSleep(t)
+			}
+		}
+	}()
 
 	return rf
+}
+
+func (rf *Raft) GetLastLogNonLocking() LogEntry {
+	if len(rf.log) == 0 {
+		return LogEntry{0, 0, nil}
+	}
+	return rf.log[len(rf.log)-1]
+}
+
+func (rf *Raft) GetLastLog() LogEntry {
+	rf.Lock("GetLastLog")
+	defer rf.Unlock("GetLastLog")
+	if len(rf.log) == 0 {
+		return LogEntry{0, 0, nil}
+	}
+	return rf.log[len(rf.log)-1]
+}
+
+func (rf *Raft) MakeRequestVotes() {
+	wg := sync.WaitGroup{}
+	votes := 0
+	doneSends := 0
+	mutex := sync.Mutex{}
+	rf.Lock("MakeRequestVotes")
+	curTerm := rf.term
+	rf.votedFor = rf.me
+	rf.Unlock("MakeRequestVotes")
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(server int) {
+			lastLog := rf.GetLastLog()
+			rf.Lock("MakeRequestVotes 0")
+			args := RequestVoteArgs{rf.term, rf.me, lastLog.Index, lastLog.Term}
+			// release lock before send rpc
+			rf.Unlock("MakeRequestVotes 0")
+			reply := RequestVoteReply{0, false}
+			DPrintf("server[%v][%v] send rv rpc to server[%v]", rf.me, rf.term, server)
+			ok := rf.sendRequestVote(server, &args, &reply)
+			DPrintf("server[%v][%v] send rv rpc to server[%v], network=%v, reply=%v", rf.me, rf.term, server, ok, reply.VoteGranted)
+
+			mutex.Lock()
+			if ok {
+				rf.Lock("MakeRequestVotes 1")
+				if reply.VoteGranted {
+					DPrintf("server[%v][%v] receive vote from server[%v]", rf.me, rf.term, server)
+					votes++
+					if votes >= len(rf.peers)/2 && rf.status == CANDIDATE && reply.Term == rf.term {
+						// second condition check whether this reply outdated
+						rf.status = LEADER
+					}
+				} else if reply.Term > rf.term {
+					if reply.Term > rf.term {
+						rf.term = reply.Term
+						rf.status = FOLLOWER
+					}
+				}
+				rf.Unlock("MakeRequestVotes 1")
+			}
+			if doneSends < len(rf.peers)-1 {
+				wg.Done()
+				doneSends++
+			}
+			mutex.Unlock()
+		}(i)
+	}
+	go func() {
+		time.Sleep(time.Duration(int64(MIN_SLEEP_TIME)) * time.Millisecond)
+		mutex.Lock()
+		for ; doneSends < len(rf.peers)-1; doneSends++ {
+			wg.Done()
+		}
+		mutex.Unlock()
+	}()
+	wg.Wait()
+	rf.Lock("MakeRequestVotes 2")
+	if curTerm == rf.term && rf.status == LEADER {
+		DPrintf("server[%v][%v] gather majority votes, stop sleep", rf.me, rf.term)
+		rf.StopSleep()
+	}
+	rf.Unlock("MakeRequestVotes 2")
+}
+
+func (rf *Raft) getEntryNonLocking(index int) (int, LogEntry) {
+	if index < 0 || len(rf.log) == 0 {
+		return -1, LogEntry{0, 0, nil}
+	}
+	lo := 0
+	hi := len(rf.log)
+	for {
+		mi := lo + (hi-lo)/2
+		if rf.log[mi].Index == index {
+			return mi, rf.log[mi]
+		} else if rf.log[mi].Index > index {
+			hi = mi
+		} else {
+			lo = mi + 1
+		}
+		if lo >= hi {
+			return -1, LogEntry{0, 0, nil}
+		}
+	}
+}
+
+func (rf *Raft) getEntry(index int) (int, LogEntry) {
+	rf.Lock("getEntry")
+	defer rf.Unlock("getEntry")
+	if index < 0 || len(rf.log) == 0 {
+		return -1, LogEntry{0, 0, nil}
+	}
+	lo := 0
+	hi := len(rf.log)
+	for {
+		mi := lo + (hi-lo)/2
+		if rf.log[mi].Index == index {
+			return mi, rf.log[mi]
+		} else if rf.log[mi].Index > index {
+			hi = mi
+		} else {
+			lo = mi + 1
+		}
+		if lo >= hi {
+			return -1, LogEntry{0, 0, nil}
+		}
+	}
+}
+
+func (rf *Raft) getNextIndex(server int) int {
+	rf.Lock("getNextIndex")
+	defer rf.Unlock("getNextIndex")
+	if server < 0 || server >= len(rf.peers) {
+		return 0
+	}
+	return rf.nextIndex[server]
+}
+
+func (rf *Raft) getAppendEntries(server int) []LogEntry {
+	rf.Lock("getAppendEntries")
+	defer rf.Unlock("getAppendEntries")
+	if server < 0 || server >= len(rf.peers) || len(rf.log) == 0 {
+		return nil
+	}
+	nextIndex := rf.nextIndex[server]
+	if nextIndex >= len(rf.log) {
+		return nil
+	}
+	return rf.log[nextIndex:]
+}
+
+func (rf *Raft) MakeAppendEntries() {
+	wg := sync.WaitGroup{}
+	doneSends := 0
+	mutex := sync.Mutex{}
+	rf.Lock("MakeAppendEntries")
+	curTerm := rf.term
+	rf.Unlock("MakeAppendEntries")
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		lastLog := rf.GetLastLog()
+		entries := rf.getAppendEntries(i)
+		go func(server int, prevLogIndex int, prevLogTerm int, entries []LogEntry) {
+			rf.Lock("MakeAppendEntries 0")
+			args := AppendEntriesArgs{rf.term, rf.me, prevLogIndex, prevLogTerm, rf.commitIndex, entries}
+			// release lock before send rpc
+			rf.Unlock("MakeAppendEntries 0")
+			reply := AppendEntriesReply{0, false}
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			mutex.Lock()
+			rf.Lock("MakeAppendEntries 1")
+			if ok && rf.status == LEADER {
+				if reply.Success && reply.Term == curTerm && len(entries) > 0 {
+					rf.nextIndex[server] = entries[len(entries)-1].Index + 1
+					rf.matchIndex[server] = entries[len(entries)-1].Index
+				} else if !reply.Success && reply.Term > curTerm && rf.term < reply.Term {
+					rf.term = reply.Term
+					rf.status = FOLLOWER
+				} else if !reply.Success && reply.Term == curTerm && rf.term == curTerm {
+					rf.nextIndex[server] = Max(1, rf.nextIndex[server]-1)
+				}
+			}
+			rf.Unlock("MakeAppendEntries 1")
+			if doneSends < len(rf.peers)-1 {
+				wg.Done()
+				doneSends++
+			}
+			mutex.Unlock()
+		}(i, lastLog.Index, lastLog.Term, entries)
+	}
+	go func() {
+		time.Sleep(time.Duration(int64(MIN_SLEEP_TIME)) * time.Millisecond)
+		mutex.Lock()
+		for ; doneSends < len(rf.peers)-1; doneSends++ {
+			wg.Done()
+		}
+		mutex.Unlock()
+	}()
+	wg.Wait()
+}
+
+func (rf *Raft) Lock(funcName string) {
+	DPrintf("server[%v][%v] try acquire lock in [%v]", rf.me, rf.term, funcName)
+	rf.mu.Lock()
+	DPrintf("server[%v][%v] acquire lock in [%v]", rf.me, rf.term, funcName)
+}
+
+func (rf *Raft) Unlock(funcName string) {
+	DPrintf("server[%v][%v] release lock in [%v]", rf.me, rf.term, funcName)
+	rf.mu.Unlock()
+}
+
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
 }
