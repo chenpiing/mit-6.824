@@ -8,7 +8,9 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -335,15 +337,19 @@ func TestBackup2B(t *testing.T) {
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
 	cfg.one(rand.Int(), servers, true)
-
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
+	//log.Printf("original leader = %v", leader1)
+
+	//log.Printf("disconnect servers = [%v, %v, %v]", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
+	//log.Printf("submit 50 commands that won't commit")
 	for i := 0; i < 50; i++ {
+		//log.Printf("submit lots of command[%v] that won't commit", i)
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
@@ -357,8 +363,11 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
+	//log.Printf("connect servers = [%v, %v, %v]", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
+	//log.Printf("submit 50 commands that will commit")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
+		//log.Printf("submit lots of command[%v] that will commit", i)
 		cfg.one(rand.Int(), 3, true)
 	}
 
@@ -371,13 +380,16 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect(other)
 
 	// lots more commands that won't commit
+	//log.Printf("submit 50 commands that won't commit")
 	for i := 0; i < 50; i++ {
+		//log.Printf("submit lots of command[%v] that won't commit", i)
 		cfg.rafts[leader2].Start(rand.Int())
 	}
 
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
+	//log.Printf("bring original leader = %v, followers=[%v, %v] back to life", leader1, (leader1 + 1) % servers, other)
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
@@ -386,6 +398,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect(other)
 
 	// lots of successful commands to new group.
+	//log.Printf("submit 50 commands that will commit")
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
