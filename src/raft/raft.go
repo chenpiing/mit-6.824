@@ -19,7 +19,6 @@ package raft
 
 import (
 	"labrpc"
-	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -89,9 +88,9 @@ const (
 	CANDIDATE = 1
 	LEADER    = 2
 
-	MIN_SLEEP_TIME = 400
-	MAX_SLEEP_TIME = 800
-	HEARTBEAT_TIME = 100
+	MIN_SLEEP_TIME = 200
+	MAX_SLEEP_TIME = 400
+	HEARTBEAT_TIME = 60
 )
 
 // return currentTerm and whether this server
@@ -177,9 +176,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	} else {
 		rf.log = append(rf.log[0:index+1], args.Entries...)
-		rf.commitIndex = args.LeaderCommit
+		//rf.commitIndex = args.LeaderCommit
 		reply.Success = true
 		reply.Term = rf.term
+		if args.LeaderCommit > rf.commitIndex {
+			lastLog := rf.GetLastLogNonLocking()
+			rf.commitIndex = Min(lastLog.Index, args.LeaderCommit)
+		}
 	}
 	rf.StopSleep()
 }
@@ -218,6 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	rf.Lock("RequestVote")
+	//log.Printf("[RequestVote] server[%v][%v], args = %v", rf.me, rf.term, *args)
 	defer rf.Unlock("RequestVote")
 	if args.Term > rf.term {
 		rf.term = args.Term
@@ -231,12 +235,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	lastLog := rf.GetLastLogNonLocking()
+	//log.Printf("[RequestVote] server[%v][%v] last log = %v", rf.me, rf.term, lastLog)
 	logUpToDate := args.LastLogTerm > lastLog.Term || ((lastLog.Term == args.LastLogTerm) && (args.LastLogIndex >= lastLog.Index))
 	reply.VoteGranted = (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && logUpToDate
 	reply.Term = rf.term
 	if reply.VoteGranted && rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
 	}
+	//log.Printf("[RequestVote] server[%v][%v] reply = %v", rf.me, rf.term, *reply)
 }
 
 //
@@ -428,6 +434,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case CANDIDATE:
 				DPrintf("server[%v][%v] as candidate", rf.me, rf.term)
 				// setup request votes process
+				term := rf.term
 				go rf.MakeRequestVotes()
 				t := rand.Int63n(int64(MAX_SLEEP_TIME-MIN_SLEEP_TIME)) + int64(MIN_SLEEP_TIME)
 				res := rf.StartSleep(t)
@@ -437,6 +444,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.status = CANDIDATE
 					rf.term++
 					rf.Unlock("Make.CANDIDATE case")
+				} else if term == rf.term && rf.status == CANDIDATE {
+					rf.Lock("candidate becomes leader")
+					rf.status = LEADER
+					rf.Unlock("candidate becomes leader")
 				}
 			case LEADER:
 				DPrintf("server[%v][%v] as leader", rf.me, rf.term)
@@ -459,14 +470,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							cnt++
 						}
 					}
-					if cnt >= (len(rf.peers)+1)/2 {
+					if cnt >= len(rf.peers)/2 {
 						rf.commitIndex = lastLog.Index
-						log.Printf("leader[%v][%v] update commitIndex=%v", rf.me, rf.term, rf.commitIndex)
+						//log.Printf("leader[%v][%v] update commitIndex=%v, lastApplied=%v, loglen=%v, log=%v", rf.me, rf.term, rf.commitIndex, rf.lastApplied, len(rf.log), rf.log)
 					}
 				}
 				rf.Unlock("leader count replicas")
 			}
-			time.Sleep(time.Duration(50) * time.Millisecond)
+			time.Sleep(time.Duration(30) * time.Millisecond)
 		}
 	}()
 
@@ -476,13 +487,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if rf.commitIndex > rf.lastApplied {
 				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 					_, entry := rf.getEntryNonLocking(i)
-					log.Printf("server[%v][%v] apply msg[%v]=%v", rf.me, rf.term, i, entry)
+					//log.Printf("server[%v][%v] apply msg[%v]=%v", rf.me, rf.term, i, entry)
 					applyCh <- ApplyMsg{true, entry.Command, entry.Index}
 					rf.lastApplied++
 				}
 			}
 			rf.Unlock("check apply msg")
-			time.Sleep(time.Duration(50) * time.Millisecond)
+			time.Sleep(time.Duration(30) * time.Millisecond)
 		}
 	}()
 
@@ -522,7 +533,7 @@ func (rf *Raft) MakeRequestVotes() {
 		go func(server int) {
 			lastLog := rf.GetLastLog()
 			rf.Lock("MakeRequestVotes 0")
-			args := RequestVoteArgs{rf.term, rf.me, lastLog.Index, lastLog.Term}
+			args := RequestVoteArgs{rf.term, rf.me, lastLog.Term, lastLog.Index}
 			// release lock before send rpc
 			rf.Unlock("MakeRequestVotes 0")
 			reply := RequestVoteReply{0, false}
@@ -536,10 +547,10 @@ func (rf *Raft) MakeRequestVotes() {
 				if reply.VoteGranted {
 					DPrintf("server[%v][%v] receive vote from server[%v]", rf.me, rf.term, server)
 					votes++
-					if votes >= len(rf.peers)/2 && rf.status == CANDIDATE && reply.Term == rf.term {
-						// second condition check whether this reply outdated
-						rf.status = LEADER
-					}
+					//if votes >= len(rf.peers)/2 && rf.status == CANDIDATE && reply.Term == rf.term {
+					//	// second condition check whether this reply outdated
+					//	rf.status = LEADER
+					//}
 				} else if reply.Term > rf.term {
 					if reply.Term > rf.term {
 						rf.term = reply.Term
@@ -556,6 +567,30 @@ func (rf *Raft) MakeRequestVotes() {
 		}(i)
 	}
 	go func() {
+		start := time.Now().UnixNano() / 1e6
+		for true {
+			done := false
+			mutex.Lock()
+			rf.Lock("wait for gathering votes")
+			if votes >= len(rf.peers)/2 && rf.status == CANDIDATE && curTerm == rf.term {
+				DPrintf("server[%v][%v] gathered majority votes", rf.me, rf.term)
+				rf.StopSleep()
+				done = true
+			} else if rf.status == FOLLOWER || rf.status == LEADER || curTerm < rf.term {
+				done = true
+			}
+			rf.Unlock("wait for gathering votes")
+			mutex.Unlock()
+			if done {
+				break
+			}
+			if time.Now().UnixNano()/1e6 > start+MIN_SLEEP_TIME {
+				break
+			}
+			time.Sleep(time.Duration(30) * time.Millisecond)
+		}
+	}()
+	go func() {
 		time.Sleep(time.Duration(int64(MIN_SLEEP_TIME)) * time.Millisecond)
 		mutex.Lock()
 		for ; doneSends < len(rf.peers)-1; doneSends++ {
@@ -564,12 +599,13 @@ func (rf *Raft) MakeRequestVotes() {
 		mutex.Unlock()
 	}()
 	wg.Wait()
-	rf.Lock("MakeRequestVotes 2")
-	if curTerm == rf.term && rf.status == LEADER {
-		DPrintf("server[%v][%v] gather majority votes, stop sleep", rf.me, rf.term)
-		rf.StopSleep()
-	}
-	rf.Unlock("MakeRequestVotes 2")
+	DPrintf("server[%v][%v] done MakeRequestVotes", rf.me, rf.term)
+	//rf.Lock("MakeRequestVotes 2")
+	//if curTerm == rf.term && rf.status == LEADER {
+	//	DPrintf("server[%v][%v] gather majority votes, stop sleep", rf.me, rf.term)
+	//	rf.StopSleep()
+	//}
+	//rf.Unlock("MakeRequestVotes 2")
 }
 
 func (rf *Raft) getEntryNonLocking(index int) (int, LogEntry) {
@@ -667,7 +703,7 @@ func (rf *Raft) MakeAppendEntries() {
 		}(i, prevLog.Index, prevLog.Term, entries)
 	}
 	go func() {
-		time.Sleep(time.Duration(int64(MIN_SLEEP_TIME)) * time.Millisecond)
+		time.Sleep(time.Duration(int64(HEARTBEAT_TIME)) * time.Millisecond)
 		mutex.Lock()
 		for ; doneSends < len(rf.peers)-1; doneSends++ {
 			wg.Done()
@@ -690,6 +726,13 @@ func (rf *Raft) Unlock(funcName string) {
 
 func Max(x, y int) int {
 	if x > y {
+		return x
+	}
+	return y
+}
+
+func Min(x, y int) int {
+	if x < y {
 		return x
 	}
 	return y
