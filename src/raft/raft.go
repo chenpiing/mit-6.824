@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -88,8 +90,8 @@ const (
 	CANDIDATE = 1
 	LEADER    = 2
 
-	MIN_SLEEP_TIME = 200
-	MAX_SLEEP_TIME = 400
+	MIN_SLEEP_TIME = 300
+	MAX_SLEEP_TIME = 600
 	HEARTBEAT_TIME = 60
 )
 
@@ -110,12 +112,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.term)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -127,17 +130,18 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var votedFor int
+	var term int
+	var log []LogEntry
+	if d.Decode(&votedFor) != nil || d.Decode(&term) != nil || d.Decode(&log) != nil {
+		panic("decoder error")
+	} else {
+		rf.votedFor = votedFor
+		rf.term = term
+		rf.log = log
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -184,6 +188,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = Min(lastLog.Index, args.LeaderCommit)
 		}
 	}
+	rf.persist()
 	rf.StopSleep()
 }
 
@@ -305,6 +310,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	lastLog := rf.GetLastLogNonLocking()
 	entry := LogEntry{lastLog.Index + 1, rf.term, command}
 	rf.log = append(rf.log, entry)
+	rf.persist()
 
 	return entry.Index, entry.Term, true
 }
@@ -396,8 +402,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.votedFor = -1
-	rf.term = 0
+	//rf.votedFor = -1
+	//rf.term = 0
 	rf.status = FOLLOWER
 
 	rf.timeChan = make(chan int64)
