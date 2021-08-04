@@ -104,6 +104,12 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.term, rf.status == LEADER
 }
 
+func (rf *Raft) ApplyFinish() bool {
+	rf.Lock("ApplyFinish")
+	defer rf.Unlock("ApplyFinish")
+	return rf.commitIndex == rf.lastApplied
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -428,7 +434,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			switch rf.status {
 			case FOLLOWER:
-				DPrintf("server[%v][%v] as follower, log=%v, lastApplied=%v, commitIndex=%v", rf.me, rf.term, rf.log, rf.lastApplied, rf.commitIndex)
+				//log.Printf("server[%v][%v] as follower, log=%v, lastApplied=%v, commitIndex=%v", rf.me, rf.term, rf.log, rf.lastApplied, rf.commitIndex)
 				t := rand.Int63n(int64(MAX_SLEEP_TIME-MIN_SLEEP_TIME)) + int64(MIN_SLEEP_TIME)
 				res := rf.StartSleep(t)
 				if res {
@@ -438,7 +444,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.Unlock("Make.FOLLOWER case")
 				}
 			case CANDIDATE:
-				DPrintf("server[%v][%v] as candidate", rf.me, rf.term)
+				//log.Printf("server[%v][%v] as candidate, log=%v", rf.me, rf.term, rf.log)
 				// setup request votes process
 				term := rf.term
 				go rf.MakeRequestVotes()
@@ -456,7 +462,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.Unlock("candidate becomes leader")
 				}
 			case LEADER:
-				DPrintf("server[%v][%v] as leader", rf.me, rf.term)
+				//log.Printf("server[%v][%v] as leader, log=%v, lastApplied=%v, commitIndex=%v", rf.me, rf.term, rf.log, rf.lastApplied, rf.commitIndex)
 				rf.MakeAppendEntries()
 				t := int64(HEARTBEAT_TIME)
 				rf.StartSleep(t)
@@ -667,6 +673,7 @@ func (rf *Raft) getAppendEntries(server int) []LogEntry {
 }
 
 func (rf *Raft) MakeAppendEntries() {
+	//log.Printf("leader[%v][%v] MakeAppendEntries", rf.me, rf.term)
 	wg := sync.WaitGroup{}
 	doneSends := 0
 	mutex := sync.Mutex{}
@@ -716,17 +723,19 @@ func (rf *Raft) MakeAppendEntries() {
 		}
 		mutex.Unlock()
 	}()
+	//log.Printf("leader[%v][%v] MakeAppendEntries waiting", rf.me, rf.term)
 	wg.Wait()
+	//log.Printf("leader[%v][%v] MakeAppendEntries finish", rf.me, rf.term)
 }
 
 func (rf *Raft) Lock(funcName string) {
-	DPrintf("server[%v][%v] try acquire lock in [%v]", rf.me, rf.term, funcName)
+	LockPrintf("server[%v][%v] try acquire lock in [%v]", rf.me, rf.term, funcName)
 	rf.mu.Lock()
-	DPrintf("server[%v][%v] acquire lock in [%v]", rf.me, rf.term, funcName)
+	LockPrintf("server[%v][%v] acquire lock in [%v]", rf.me, rf.term, funcName)
 }
 
 func (rf *Raft) Unlock(funcName string) {
-	DPrintf("server[%v][%v] release lock in [%v]", rf.me, rf.term, funcName)
+	LockPrintf("server[%v][%v] release lock in [%v]", rf.me, rf.term, funcName)
 	rf.mu.Unlock()
 }
 
